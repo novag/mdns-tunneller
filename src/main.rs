@@ -13,7 +13,7 @@ use tokio::{
     sync::mpsc::{self, UnboundedReceiver},
 };
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use tracing::{info, Level};
+use tracing::{info, warn, Level};
 use tunnel::TunnelPeer;
 
 use crate::config::get_filter_domains;
@@ -67,17 +67,30 @@ async fn main() -> Result<()> {
     let channel_rx = forward(channel_rx);
 
     if is_client {
-        let tcp = TcpStream::connect(&addr).await?;
-        info!("connected");
-
         tokio::task::spawn_blocking(move || mdns_listener.listen());
-        let tunnel = TunnelPeer {
-            mdns_sender,
-            channel_rx,
-            tcp: Framed::new(tcp, LengthDelimitedCodec::new()),
-            socket_addr: None,
-        };
-        tunnel.select_run().await;
+
+        let mut backoff = 1u64;
+        loop {
+            match TcpStream::connect(&addr).await {
+                Ok(tcp) => {
+                    info!("connected");
+                    backoff = 1;
+                    let tunnel = TunnelPeer {
+                        mdns_sender: mdns_sender.clone(),
+                        channel_rx: channel_rx.clone(),
+                        tcp: Framed::new(tcp, LengthDelimitedCodec::new()),
+                        socket_addr: None,
+                    };
+                    tunnel.select_run().await;
+                    warn!("disconnected from server, reconnecting...");
+                }
+                Err(e) => {
+                    warn!(?e, backoff_secs = backoff, "failed to connect, retrying...");
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(backoff)).await;
+            backoff = (backoff * 2).min(30);
+        }
     } else {
         let listener = TcpListener::bind(&addr).await?;
         info!("start listening");
