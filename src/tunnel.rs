@@ -1,4 +1,4 @@
-use crate::mdns::mDNSSender;
+use crate::mdns::{self, mDNSSender};
 use async_channel::Receiver;
 use bytes::Bytes;
 use futures::SinkExt;
@@ -43,8 +43,12 @@ impl TunnelPeer {
                 matched = tcp.next() => {
                     match matched {
                         Some(Ok(packet)) => {
+                            let raw = packet.to_vec();
+                            if let Some(summary) = mdns::describe_raw(&raw) {
+                                info!(summary, "tunnel: received mDNS from peer");
+                            }
                             let mut lock = mdns_sender.lock().await;
-                            if let Some(Err(e)) = lock.send(&packet.to_vec()) {
+                            if let Some(Err(e)) = lock.send(&raw) {
                                 error!(?e, "mdns sender send err");
                                 break;
                             }

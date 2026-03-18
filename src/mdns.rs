@@ -6,13 +6,15 @@ use pnet::{
         ethernet::{EtherTypes, EthernetPacket},
         ip::IpNextHeaderProtocols,
         ipv4::Ipv4Packet,
+        ipv6::Ipv6Packet,
         udp::UdpPacket,
         Packet,
     },
 };
+use std::fmt::Write;
 use std::io;
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::info;
+use tracing::{debug, info};
 
 /// An mDNS listener on a specific interface.
 #[allow(non_camel_case_types)]
@@ -32,7 +34,10 @@ impl mDNSListener {
         while let Ok(packet) = self.eth_rx.next() {
             if let Some(eth) = EthernetPacket::new(packet) {
                 if let Some(mdns) = mdns_packet(&eth, &mut mdns_buf) {
+                    let summary = describe_mdns(&mdns);
+                    debug!(summary, "local: received mDNS from interface");
                     if filter_packet(&mdns, &self.filter_domains) {
+                        info!(summary, "tunnel: forwarding mDNS to peer");
                         if self.channel_tx.send(packet.to_vec()).is_err() {
                             break;
                         }
@@ -52,6 +57,13 @@ pub struct mDNSSender {
 impl mDNSSender {
     /// packet is a `EthernetPacket` with `mDNS`
     pub fn send(&mut self, packet: &[u8]) -> Option<Result<(), io::Error>> {
+        let mut mdns_buf = Vec::new();
+        if let Some(eth) = EthernetPacket::new(packet) {
+            if let Some(mdns) = mdns_packet(&eth, &mut mdns_buf) {
+                let summary = describe_mdns(&mdns);
+                info!(summary, "local: sending mDNS to interface");
+            }
+        }
         self.eth_tx.send_to(packet, None)
     }
 }
@@ -77,12 +89,22 @@ pub fn pair(
     )
 }
 
-/// get multicast dns packet  
+/// get multicast dns packet
 fn mdns_packet<'a>(ethernet: &EthernetPacket, buf: &'a mut Vec<u8>) -> Option<mDNSPacket<'a>> {
     fn ipv4_packet(payload: &[u8]) -> Option<Ipv4Packet> {
         let packet = Ipv4Packet::new(payload)?;
         if !packet.get_destination().is_multicast()
             || !matches!(packet.get_next_level_protocol(), IpNextHeaderProtocols::Udp)
+        {
+            return None;
+        }
+        Some(packet)
+    }
+
+    fn ipv6_packet(payload: &[u8]) -> Option<Ipv6Packet> {
+        let packet = Ipv6Packet::new(payload)?;
+        if !packet.get_destination().is_multicast()
+            || !matches!(packet.get_next_header(), IpNextHeaderProtocols::Udp)
         {
             return None;
         }
@@ -100,42 +122,65 @@ fn mdns_packet<'a>(ethernet: &EthernetPacket, buf: &'a mut Vec<u8>) -> Option<mD
             *buf = udp_packet.payload().to_vec();
             mDNSPacket::parse(buf).ok()
         }
+        EtherTypes::Ipv6 => {
+            let ipv6_packet = ipv6_packet(ethernet.payload())?;
+            let udp_packet = udp_packet(ipv6_packet.payload())?;
+            *buf = udp_packet.payload().to_vec();
+            mDNSPacket::parse(buf).ok()
+        }
         _ => None,
     }
 }
 
-fn filter_packet(packet: &mDNSPacket, domains: &Vec<String>) -> bool {
+fn rdata_type(data: &dns_parser::RData) -> &'static str {
+    match data {
+        dns_parser::RData::A(_) => "A",
+        dns_parser::RData::AAAA(_) => "AAAA",
+        dns_parser::RData::CNAME(_) => "CNAME",
+        dns_parser::RData::PTR(_) => "PTR",
+        dns_parser::RData::NS(_) => "NS",
+        dns_parser::RData::MX(_) => "MX",
+        dns_parser::RData::SRV(_) => "SRV",
+        dns_parser::RData::SOA(_) => "SOA",
+        dns_parser::RData::TXT(_) => "TXT",
+        dns_parser::RData::Unknown(_) => "Unknown",
+    }
+}
+
+fn describe_mdns(packet: &mDNSPacket) -> String {
+    let mut desc = String::new();
+    for q in &packet.questions {
+        let _ = write!(desc, "query({} {:?}) ", q.qname, q.qtype);
+    }
+    let names: Vec<String> = packet
+        .answers
+        .iter()
+        .map(|a| format!("{} {}", a.name, rdata_type(&a.data)))
+        .collect();
+    if !names.is_empty() {
+        let _ = write!(desc, "{} answers: {}", names.len(), names.join(", "));
+    }
+    desc.trim_end().to_string()
+}
+
+/// Describe an mDNS packet from raw ethernet frame bytes, for logging.
+pub fn describe_raw(raw: &[u8]) -> Option<String> {
+    let mut buf = Vec::new();
+    let eth = EthernetPacket::new(raw)?;
+    let mdns = mdns_packet(&eth, &mut buf)?;
+    Some(describe_mdns(&mdns))
+}
+
+fn filter_packet(packet: &mDNSPacket, domains: &[String]) -> bool {
     let question_matched = packet
         .questions
         .iter()
-        .filter(|record| {
-            let record_name = record.qname.to_string();
-            let matched = domains.contains(&record_name);
-            if matched {
-                info!("found query packet, domain: {}", record_name);
-            }
-            matched
-        })
-        .count()
-        > 0;
+        .any(|record| domains.contains(&record.qname.to_string()));
 
     let answer_matched = packet
         .answers
         .iter()
-        .filter(|record| {
-            let record_name = record.name.to_string();
-            let matched = domains.contains(&record_name);
-
-            if matched {
-                info!(
-                    "found answer packet, domain: {} at: {:?}",
-                    record_name, &record.data
-                );
-            }
-            matched
-        })
-        .count()
-        > 0;
+        .any(|record| domains.contains(&record.name.to_string()));
 
     question_matched || answer_matched
 }

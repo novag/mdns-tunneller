@@ -25,24 +25,29 @@ enum Args {
         addr: String,
         #[clap(short, long)]
         interface: String,
+        #[clap(short, long)]
+        verbose: bool,
     },
     Client {
         #[clap(short, long)]
         addr: String,
         #[clap(short, long)]
         interface: String,
+        #[clap(short, long)]
+        verbose: bool,
     },
 }
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt().with_max_level(Level::INFO).init();
-
     let args = Args::parse();
-    let (is_client, addr, iface_name) = match args {
-        Args::Server { addr, interface } => (false, addr, interface),
-        Args::Client { addr, interface } => (true, addr, interface),
+    let (is_client, addr, iface_name, verbose) = match args {
+        Args::Server { addr, interface, verbose } => (false, addr, interface, verbose),
+        Args::Client { addr, interface, verbose } => (true, addr, interface, verbose),
     };
+
+    let max_level = if verbose { Level::DEBUG } else { Level::INFO };
+    tracing_subscriber::fmt().with_max_level(max_level).init();
     info!(?is_client, ?addr, ?iface_name);
 
     let interface_names_match = |iface: &NetworkInterface| iface.name == iface_name;
