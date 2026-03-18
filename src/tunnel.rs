@@ -8,7 +8,7 @@ use tokio::net::TcpStream;
 use tokio::sync::Mutex;
 use tokio_stream::StreamExt;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
-use tracing::{error, info};
+use tracing::{error, info, warn};
 
 pub struct TunnelPeer {
     pub mdns_sender: Arc<Mutex<mDNSSender>>,
@@ -49,8 +49,12 @@ impl TunnelPeer {
                             }
                             let mut lock = mdns_sender.lock().await;
                             if let Some(Err(e)) = lock.send(&raw) {
-                                error!(?e, "mdns sender send err");
-                                break;
+                                if e.raw_os_error() == Some(libc::EMSGSIZE) {
+                                    warn!("mdns packet too large to send, skipping");
+                                } else {
+                                    error!(?e, "mdns sender send err");
+                                    break;
+                                }
                             }
                         },
                         Some(Err(e)) => {

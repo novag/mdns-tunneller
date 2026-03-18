@@ -17,11 +17,19 @@ use std::hash::{Hash, Hasher};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::os::unix::io::AsRawFd;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::mpsc::UnboundedSender;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 const IPV6_HDRINCL: libc::c_int = 36;
+
+// IPv6 minimum MTU (1280) minus IPv6 header (40) minus Fragment Extension Header (8).
+// Rounded down to multiple of 8 as required by IPv6 fragmentation.
+// Used as a conservative fallback when we get EMSGSIZE.
+const FALLBACK_IPV6_FRAG_PAYLOAD: usize = (1280 - 40 - 8) & !7; // 1232
+
+static FRAG_ID: AtomicU32 = AtomicU32::new(1);
 
 type RecentPackets = Arc<Mutex<VecDeque<u64>>>;
 type TrackedHostnames = Arc<Mutex<HashSet<String>>>;
@@ -208,9 +216,30 @@ impl mDNSSender {
                     self.iface_index,
                 ))
                 .into();
-                self.raw6.send_to(ip_packet, &dest)
-                    .map(|_| ())
-                    .map_err(io::Error::from)
+                match self.raw6.send_to(ip_packet, &dest) {
+                    Ok(_) => Ok(()),
+                    Err(e) if e.raw_os_error() == Some(libc::EMSGSIZE) => {
+                        if let Some(fragments) = fragment_ipv6(ip_packet, FALLBACK_IPV6_FRAG_PAYLOAD) {
+                            warn!(
+                                original_size = ip_packet.len(),
+                                max_fragment_payload = FALLBACK_IPV6_FRAG_PAYLOAD,
+                                count = fragments.len(),
+                                "EMSGSIZE: fragmenting IPv6 packet"
+                            );
+                            let mut result = Ok(());
+                            for frag in &fragments {
+                                if let Err(e) = self.raw6.send_to(frag, &dest) {
+                                    result = Err(io::Error::from(e));
+                                    break;
+                                }
+                            }
+                            result
+                        } else {
+                            Err(io::Error::from(e))
+                        }
+                    }
+                    Err(e) => Err(io::Error::from(e)),
+                }
             }
         } else {
             Ok(())
@@ -414,6 +443,60 @@ fn matches_tracked_hostname(packet: &mDNSPacket, hostnames: &HashSet<String>) ->
             .answers
             .iter()
             .any(|a| check(&a.name.to_string()))
+}
+
+// Fragment an IPv6 packet using the given max fragment payload size.
+// The payload size must be a multiple of 8.
+fn fragment_ipv6(ip_packet: &[u8], max_frag_payload: usize) -> Option<Vec<Vec<u8>>> {
+    const IPV6_HDR: usize = 40;
+    const FRAG_HDR: usize = 8;
+
+    if ip_packet.len() < IPV6_HDR {
+        return None;
+    }
+
+    let max_payload = max_frag_payload & !7; // ensure multiple of 8
+    let original_next_header = ip_packet[6];
+    let payload = &ip_packet[IPV6_HDR..];
+    let ident = FRAG_ID.fetch_add(1, Ordering::Relaxed);
+
+    let mut fragments = Vec::new();
+    let mut offset = 0;
+
+    while offset < payload.len() {
+        let remaining = payload.len() - offset;
+        let chunk = if remaining > max_payload {
+            max_payload
+        } else {
+            remaining
+        };
+        let more = offset + chunk < payload.len();
+
+        let mut frag = Vec::with_capacity(IPV6_HDR + FRAG_HDR + chunk);
+
+        // IPv6 header — copy and patch next_header + payload_length
+        frag.extend_from_slice(&ip_packet[..IPV6_HDR]);
+        frag[6] = 44; // Next Header = Fragment (44)
+        let payload_len = (FRAG_HDR + chunk) as u16;
+        frag[4] = (payload_len >> 8) as u8;
+        frag[5] = payload_len as u8;
+
+        // Fragment Extension Header (8 bytes)
+        frag.push(original_next_header); // Next Header (e.g. UDP=17)
+        frag.push(0); // Reserved
+        let frag_off_field = ((offset as u16 / 8) << 3) | if more { 1 } else { 0 };
+        frag.push((frag_off_field >> 8) as u8);
+        frag.push(frag_off_field as u8);
+        frag.extend_from_slice(&ident.to_be_bytes());
+
+        // Fragment data
+        frag.extend_from_slice(&payload[offset..offset + chunk]);
+
+        fragments.push(frag);
+        offset += chunk;
+    }
+
+    Some(fragments)
 }
 
 fn filter_packet(packet: &mDNSPacket, domains: &[String]) -> bool {
